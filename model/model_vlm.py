@@ -55,7 +55,7 @@ class MiniMindVLM(MiniMindForCausalLM):
         hf_logging.set_verbosity_error()
         if not os.path.exists(model_path):
             return None, None
-        model = CLIPModel.from_pretrained(model_path)
+        model = CLIPModel.from_pretrained(model_path) # 加载 CLIP 模型 作为视觉编码器
         processor = CLIPProcessor.from_pretrained(model_path)
         # 冻结 vision_encoder 的所有参数
         for param in model.parameters():
@@ -73,10 +73,14 @@ class MiniMindVLM(MiniMindForCausalLM):
         with torch.no_grad():
             outputs = vision_model.vision_model(pixel_values=image_tensors)
         img_embedding = outputs.last_hidden_state[:, 1:, :].squeeze()
+        '''
+        - [:, 1:, :] ：跳过 CLS token（索引 0），只保留 196 个 patch token
+        - squeeze() ：压缩维度，得到形状为 (196, 768) 的特征
+        '''
         return img_embedding
 
     def count_vision_proj(self, tokens, h, vision_tensors=None, seqlen=512):
-        def find_indices(tokens, image_ids):
+        def find_indices(tokens, image_ids): # 查找输入tolen中的视觉编码占位符，返回占位符的起始和结束索引
             image_ids_tensor = torch.tensor(image_ids).to(tokens.device)
             len_image_ids = len(image_ids)
             if len_image_ids > tokens.size(1):
@@ -95,7 +99,7 @@ class MiniMindVLM(MiniMindForCausalLM):
             if len(vision_proj.shape) == 3:
                 vision_proj = vision_proj.unsqueeze(0)
             new_h = []
-            for i in range(h.size(0)):
+            for i in range(h.size(0)): # 视觉特征替换占位符
                 if i in image_indices:
                     h_i = h[i]
                     img_idx = 0
@@ -124,9 +128,9 @@ class MiniMindVLM(MiniMindForCausalLM):
         past_key_values = past_key_values or [None] * len(self.model.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
-        hidden_states = self.model.dropout(self.model.embed_tokens(input_ids))
+        hidden_states = self.model.dropout(self.model.embed_tokens(input_ids)) # 初始文本嵌入
 
-        if pixel_values is not None and start_pos == 0:
+        if pixel_values is not None and start_pos == 0: # 只在首次推理时处理输入图像，后续推理时使用缓存的视觉特征
             if len(pixel_values.shape) == 6:
                 pixel_values = pixel_values.squeeze(2)
             bs, num, c, im_h, im_w = pixel_values.shape
@@ -136,8 +140,8 @@ class MiniMindVLM(MiniMindForCausalLM):
                 for i in range(num)
             ], dim=stack_dim)
             hidden_states = self.count_vision_proj(tokens=input_ids, h=hidden_states, vision_tensors=vision_tensors,
-                                                   seqlen=input_ids.shape[1])
-
+                                                   seqlen=input_ids.shape[1]) # 融合视觉特征和文本
+        # 位置编码 RoPE
         position_embeddings = (
             self.model.freqs_cos[start_pos:start_pos + seq_length],
             self.model.freqs_sin[start_pos:start_pos + seq_length]
@@ -154,9 +158,9 @@ class MiniMindVLM(MiniMindForCausalLM):
             )
             presents.append(present)
 
-        hidden_states = self.model.norm(hidden_states)
+        hidden_states = self.model.norm(hidden_states) # 层归一化
 
-        aux_loss = sum([l.mlp.aux_loss for l in self.model.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        aux_loss = sum([l.mlp.aux_loss for l in self.model.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze()) # 计算 MOE 损失(若启用MOE)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
